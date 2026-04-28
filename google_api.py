@@ -119,7 +119,7 @@ def create_play_slides(play_name: str):
     return new_id, url
 
 
-DESTINATION_FOLDER_ID = "17xFdO-SybxvP7CgpqYHXdTxN0H2GGqbS"
+DESTINATION_FOLDER_ID = "1M9q0f3JQLufJASXuAZ8PB86TfkGJDted"
 
 
 def share_file_public(file_id: str):

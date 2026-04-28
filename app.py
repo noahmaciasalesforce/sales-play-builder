@@ -259,7 +259,7 @@ if submitted:
             st.write("Content filled in.")
 
             status.update(label="Sales play created!", state="complete")
-            folder_url = "https://drive.google.com/drive/folders/17xFdO-SybxvP7CgpqYHXdTxN0H2GGqbS"
+            folder_url = "https://drive.google.com/drive/folders/1M9q0f3JQLufJASXuAZ8PB86TfkGJDted"
             st.success(
                 f"Your new Sales Play can be found here: [Sales Play Library]({folder_url})"
             )
