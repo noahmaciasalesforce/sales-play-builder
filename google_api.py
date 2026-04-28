@@ -1,23 +1,33 @@
-import os
 from pathlib import Path
 from typing import Optional
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google.auth.transport.requests import Request
 
 SCOPES = [
     "https://www.googleapis.com/auth/presentations",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
 TOKEN_PATH = Path(__file__).parent / "token.json"
-
 TEMPLATE_ID = "1GB4ONf8eN4mX4iYlBCXmauX9ogHtNnHQg30ztkymfHw"
-# Slides are inserted immediately after this slide ("AI Play Outputs")
-INSERT_AFTER_SLIDE_ID = "g3d9d902cf0d_0_1590"
 
 
-def _creds() -> Credentials:
+def _creds():
+    # On Streamlit Cloud: use service account stored in st.secrets
+    try:
+        import streamlit as st
+        if "gcp_service_account" in st.secrets:
+            return service_account.Credentials.from_service_account_info(
+                st.secrets["gcp_service_account"],
+                scopes=SCOPES,
+            )
+    except Exception:
+        pass
+
+    # Local dev: fall back to OAuth token.json
     if not TOKEN_PATH.exists():
         raise FileNotFoundError(
             "token.json not found. Run `python3 auth.py` once to authorise your Google account."
@@ -33,80 +43,12 @@ def _slides():
     return build("slides", "v1", credentials=_creds())
 
 
-# ---------------------------------------------------------------------------
-# Step 1 — duplicate template slides in-deck and position after "AI Play Outputs"
-# ---------------------------------------------------------------------------
-
-def create_play_slides(play_name: str):
-    """
-    Finds slides containing {{PLAY_NAME}}, duplicates them within the same
-    presentation, moves the copies right after INSERT_AFTER_SLIDE_ID.
-    Returns (new_slide_ids, url_to_first_new_slide).
-    """
-    slides_svc = _slides()
-    pres = slides_svc.presentations().get(presentationId=TEMPLATE_ID).execute()
-
-    # Identify template slides by the presence of {{PLAY_NAME}}
-    template_slide_ids = []
-    for slide in pres.get("slides", []):
-        for element in slide.get("pageElements", []):
-            shape = element.get("shape", {})
-            full_text = "".join(
-                te.get("textRun", {}).get("content", "")
-                for te in shape.get("text", {}).get("textElements", [])
-            )
-            if "{{PLAY_NAME}}" in full_text:
-                template_slide_ids.append(slide["objectId"])
-                break
-
-    if not template_slide_ids:
-        raise ValueError(
-            "No template slides found — the presentation must contain a text box "
-            "with {{PLAY_NAME}}."
-        )
-
-    # Duplicate each template slide (copies appear right after their source)
-    dup_response = slides_svc.presentations().batchUpdate(
-        presentationId=TEMPLATE_ID,
-        body={"requests": [
-            {"duplicateObject": {"objectId": sid}} for sid in template_slide_ids
-        ]},
-    ).execute()
-
-    new_slide_ids = [
-        reply["duplicateObject"]["objectId"]
-        for reply in dup_response.get("replies", [])
-        if "duplicateObject" in reply
-    ]
-
-    # Re-fetch to get the updated slide order, then find insert position
-    pres2 = slides_svc.presentations().get(presentationId=TEMPLATE_ID).execute()
-    updated_slides = pres2.get("slides", [])
-    insert_after_idx = next(
-        (i for i, s in enumerate(updated_slides) if s["objectId"] == INSERT_AFTER_SLIDE_ID),
-        len(updated_slides) - 1,
-    )
-
-    # Move new slides to right after "AI Play Outputs"
-    slides_svc.presentations().batchUpdate(
-        presentationId=TEMPLATE_ID,
-        body={"requests": [{
-            "updateSlidesPosition": {
-                "slideObjectIds": new_slide_ids,
-                "insertionIndex": insert_after_idx + 1,
-            }
-        }]},
-    ).execute()
-
-    url = (
-        f"https://docs.google.com/presentation/d/{TEMPLATE_ID}"
-        f"/edit#slide=id.{new_slide_ids[0]}"
-    )
-    return new_slide_ids, url
+def _drive():
+    return build("drive", "v3", credentials=_creds())
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — replace placeholders, apply links and bullets (scoped to new slides)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _shape_full_text(shape: dict) -> str:
@@ -116,17 +58,111 @@ def _shape_full_text(shape: dict) -> str:
     )
 
 
+def _element_contains(el: dict, needle: str) -> bool:
+    if "shape" in el:
+        return needle in _shape_full_text(el["shape"])
+    if "table" in el:
+        for row in el["table"].get("tableRows", []):
+            for cell in row.get("tableCells", []):
+                text = "".join(
+                    te.get("textRun", {}).get("content", "")
+                    for te in cell.get("text", {}).get("textElements", [])
+                )
+                if needle in text:
+                    return True
+    if "elementGroup" in el:
+        return any(_element_contains(child, needle) for child in el["elementGroup"].get("children", []))
+    return False
+
+
+def _utf16_len(s: str) -> int:
+    """Return UTF-16 code unit count — the Slides API uses these for text offsets."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — copy template to a brand-new file, strip non-template slides
+# ---------------------------------------------------------------------------
+
+def create_play_slides(play_name: str):
+    """
+    Copies the template to a new file owned by the authenticated Google account,
+    deletes all slides that don't contain {{PLAY_NAME}}, and returns (new_id, url).
+    """
+    drive = _drive()
+    slides_svc = _slides()
+
+    copy = drive.files().copy(
+        fileId=TEMPLATE_ID,
+        body={"name": f"{play_name} - Sales Play"},
+        supportsAllDrives=True,
+    ).execute()
+    new_id = copy["id"]
+
+    pres = slides_svc.presentations().get(presentationId=new_id).execute()
+    slides = pres.get("slides", [])
+
+    keep_ids = {
+        s["objectId"]
+        for s in slides
+        if any(_element_contains(el, "{{PLAY_NAME}}") for el in s.get("pageElements", []))
+    }
+    delete_ids = [s["objectId"] for s in slides if s["objectId"] not in keep_ids]
+
+    if delete_ids:
+        slides_svc.presentations().batchUpdate(
+            presentationId=new_id,
+            body={"requests": [{"deleteObject": {"objectId": sid}} for sid in delete_ids]},
+        ).execute()
+
+    url = f"https://docs.google.com/presentation/d/{new_id}/edit"
+    return new_id, url
+
+
+DESTINATION_FOLDER_ID = "17xFdO-SybxvP7CgpqYHXdTxN0H2GGqbS"
+
+
+def share_file_public(file_id: str):
+    """Make the file viewable by anyone with the link."""
+    drive = _drive()
+    drive.permissions().create(
+        fileId=file_id,
+        body={"role": "reader", "type": "anyone"},
+        supportsAllDrives=True,
+    ).execute()
+
+
+def move_to_salesforce_drive(file_id: str):
+    """Move the file into the Salesforce Shared Drive folder and remove it from personal Drive."""
+    drive = _drive()
+    file_meta = drive.files().get(
+        fileId=file_id,
+        fields="parents",
+        supportsAllDrives=True,
+    ).execute()
+    current_parents = ",".join(file_meta.get("parents", []))
+    drive.files().update(
+        fileId=file_id,
+        addParents=DESTINATION_FOLDER_ID,
+        removeParents=current_parents,
+        supportsAllDrives=True,
+        fields="id, parents",
+    ).execute()
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — replace placeholders, apply links and bullets
+# ---------------------------------------------------------------------------
+
 def replace_placeholders(
-    new_slide_ids: list,
+    pres_id: str,
     replacements: dict,
     link_map: Optional[dict] = None,
     bullet_placeholders: Optional[set] = None,
     step_links: Optional[dict] = None,
 ):
     """
-    All operations are scoped to new_slide_ids so the original template slides
-    are never touched.
-
+    pres_id:             the new (copied) presentation to operate on
     replacements:        {"{{PLAY_NAME}}": "...", ...}
     link_map:            {"{{TOP_LINK_1}}": "https://...", ...}  whole-shape links
     bullet_placeholders: {"{{DISCOVERY_QUESTIONS}}", ...}
@@ -136,72 +172,90 @@ def replace_placeholders(
     link_map = link_map or {}
     bullet_placeholders = bullet_placeholders or set()
     step_links = step_links or {}
-    new_slide_id_set = set(new_slide_ids)
 
-    def _get_target_slides(pres):
-        return [s for s in pres.get("slides", []) if s["objectId"] in new_slide_id_set]
+    # --- pre-scan: inspect the presentation BEFORE replacement so we can map
+    # placeholders → exact objectIds. This prevents cross-matching issues where
+    # a post-replacement text value accidentally matches a different shape.
+    pres_before = slides_svc.presentations().get(presentationId=pres_id).execute()
 
-    # --- pass 1: text replacement, scoped to new slides only ---
+    # objectId -> url  (shapes containing a top-link placeholder)
+    top_link_shape_map = {}
+    # objectIds of shapes that should receive bullet formatting
+    bullet_shape_ids = []
+    # "{{PLACEHOLDER}}" -> {table_obj_id, row, col}  for step link cells
+    placeholder_cell_map = {}
+    # (table_obj_id, row, col) tuples for cells that CONTAIN a replaceable placeholder.
+    # All other table cells will have bullets deleted in the cleanup pass.
+    placeholder_table_cells = set()
+
+    for slide in pres_before.get("slides", []):
+        for el in slide.get("pageElements", []):
+            shape = el.get("shape")
+            if shape:
+                text = _shape_full_text(shape)
+                obj_id = el["objectId"]
+                for ph, url in link_map.items():
+                    if ph in text:
+                        top_link_shape_map[obj_id] = url
+                for ph in bullet_placeholders:
+                    if ph in text:
+                        bullet_shape_ids.append(obj_id)
+            elif "table" in el:
+                table_obj_id = el["objectId"]
+                for ri, trow in enumerate(el["table"].get("tableRows", [])):
+                    for ci, cell in enumerate(trow.get("tableCells", [])):
+                        cell_text = "".join(
+                            te.get("textRun", {}).get("content", "")
+                            for te in cell.get("text", {}).get("textElements", [])
+                        )
+                        for placeholder in replacements:
+                            if placeholder in cell_text:
+                                placeholder_table_cells.add((table_obj_id, ri, ci))
+                        for placeholder in step_links:
+                            if placeholder in cell_text:
+                                placeholder_cell_map[placeholder] = {
+                                    "table_obj_id": table_obj_id,
+                                    "row": ri,
+                                    "col": ci,
+                                }
+
+    # --- pass 1: text replacement across entire new presentation ---
     slides_svc.presentations().batchUpdate(
-        presentationId=TEMPLATE_ID,
+        presentationId=pres_id,
         body={"requests": [
             {
                 "replaceAllText": {
                     "containsText": {"text": placeholder, "matchCase": True},
                     "replaceText": value,
-                    "pageObjectIds": new_slide_ids,
                 }
             }
             for placeholder, value in replacements.items()
         ]},
     ).execute()
 
-    # Re-read the new slides for subsequent passes
-    pres = slides_svc.presentations().get(presentationId=TEMPLATE_ID).execute()
-    target_slides = _get_target_slides(pres)
+    # Re-read after replacement for subsequent passes
+    pres = slides_svc.presentations().get(presentationId=pres_id).execute()
 
-    # --- pass 2: whole-shape hyperlinks (top resource links) and bullet detection ---
-    text_to_url = {}
-    for placeholder, url in link_map.items():
-        display_text = replacements.get(placeholder, "").strip()
-        if display_text and url:
-            text_to_url[display_text] = url
-
+    # --- pass 2: whole-shape hyperlinks on top resource link shapes ---
     link_requests = []
-    bullet_object_ids = []
-    value_to_placeholder = {v.strip(): k for k, v in replacements.items() if v}
-
-    for slide in target_slides:
-        for element in slide.get("pageElements", []):
-            shape = element.get("shape")
-            if not shape:
-                continue
-            full_text = _shape_full_text(shape).strip()
-            obj_id = element["objectId"]
-
-            url = text_to_url.get(full_text)
-            if url:
-                link_requests.append({
-                    "updateTextStyle": {
-                        "objectId": obj_id,
-                        "textRange": {"type": "ALL"},
-                        "style": {"link": {"url": url}},
-                        "fields": "link",
-                    }
-                })
-
-            placeholder_key = value_to_placeholder.get(full_text)
-            if placeholder_key in bullet_placeholders:
-                bullet_object_ids.append(obj_id)
-
+    for obj_id, url in top_link_shape_map.items():
+        link_requests.append({
+            "updateTextStyle": {
+                "objectId": obj_id,
+                "textRange": {"type": "ALL"},
+                "style": {"link": {"url": url}},
+                "fields": "link",
+            }
+        })
     if link_requests:
         slides_svc.presentations().batchUpdate(
-            presentationId=TEMPLATE_ID, body={"requests": link_requests}
+            presentationId=pres_id, body={"requests": link_requests}
         ).execute()
 
-    if bullet_object_ids:
+    # --- pass 2b: bullet formatting on messaging shapes ---
+    if bullet_shape_ids:
         slides_svc.presentations().batchUpdate(
-            presentationId=TEMPLATE_ID,
+            presentationId=pres_id,
             body={"requests": [
                 {
                     "createParagraphBullets": {
@@ -210,79 +264,112 @@ def replace_placeholders(
                         "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
                     }
                 }
-                for obj_id in bullet_object_ids
+                for obj_id in bullet_shape_ids
             ]},
         ).execute()
 
-    # --- pass 3: per-title hyperlinks inside table cells for 10-step resources ---
-    # The step placeholders live in an 11x2 table (column 1 = resource links).
-    # We find the table on each new slide, locate the cell whose text contains
-    # each resource title, then use the textRun's API-provided startIndex to
-    # apply a FIXED_RANGE link — no manual offset math needed.
-    if step_links:
-        # Build lookup: display text of step → rows with {text, url}
-        display_to_rows = {}
-        for placeholder, rows in step_links.items():
-            display_text = replacements.get(placeholder, "")
-            if display_text:
-                display_to_rows[display_text.strip()] = rows
+    # --- pass 3: per-title hyperlinks inside table cells ---
+    # For each step placeholder we pre-recorded the exact (table, row, col).
+    # After replacement, we read that cell's text and compute UTF-16 offsets
+    # for each resource title. We search starting at rep_start — the position
+    # where the replacement text begins — so we never accidentally hyperlink
+    # text in the step label portion of the same cell.
+    if step_links and placeholder_cell_map:
+        table_elements = {
+            el["objectId"]: el
+            for slide in pres.get("slides", [])
+            for el in slide.get("pageElements", [])
+            if "table" in el
+        }
 
         table_link_requests = []
+        for placeholder, rows in step_links.items():
+            cell_info = placeholder_cell_map.get(placeholder)
+            if not cell_info:
+                continue
 
-        for slide in target_slides:
-            for element in slide.get("pageElements", []):
-                if "table" not in element:
+            table_el = table_elements.get(cell_info["table_obj_id"])
+            if not table_el:
+                continue
+
+            ri, ci = cell_info["row"], cell_info["col"]
+            cell = table_el["table"]["tableRows"][ri]["tableCells"][ci]
+            cell_text = "".join(
+                te.get("textRun", {}).get("content", "")
+                for te in cell.get("text", {}).get("textElements", [])
+            )
+
+            # Find where the replacement text starts so we don't match within
+            # any step-label text that lives earlier in the same cell.
+            replacement_text = replacements.get(placeholder, "")
+            rep_start = cell_text.find(replacement_text) if replacement_text else 0
+            if rep_start == -1:
+                rep_start = 0
+
+            for row in rows:
+                title = row["text"].strip()
+                url = row.get("url", "").strip()
+                if not title or not url:
                     continue
-                table_obj_id = element["objectId"]
-                for row in element["table"].get("tableRows", []):
-                    for cell in row.get("tableCells", []):
-                        text_elements = cell.get("text", {}).get("textElements", [])
-                        cell_text = "".join(
-                            te.get("textRun", {}).get("content", "")
-                            for te in text_elements
-                        )
 
-                        # Find which step's titles live in this cell
-                        matched_rows = None
-                        for display_text, step_rows in display_to_rows.items():
-                            # Each resource title is in the cell after replacement
-                            for step_row in step_rows:
-                                if step_row["text"].strip() in cell_text:
-                                    matched_rows = step_rows
-                                    break
-                            if matched_rows:
-                                break
+                py_idx = cell_text.find(title, rep_start)
+                if py_idx == -1:
+                    continue
 
-                        if not matched_rows:
-                            continue
+                start = _utf16_len(cell_text[:py_idx])
+                end = start + _utf16_len(title)
 
-                        for step_row in matched_rows:
-                            title = step_row["text"].strip()
-                            url = step_row.get("url", "").strip()
-                            if not title or not url:
-                                continue
-                            # Find the exact textRun that contains this title
-                            for te in text_elements:
-                                content = te.get("textRun", {}).get("content", "")
-                                if title in content:
-                                    api_start = te.get("startIndex", 0)
-                                    offset = content.find(title)
-                                    table_link_requests.append({
-                                        "updateTextStyle": {
-                                            "objectId": table_obj_id,
-                                            "cellLocation": cell.get("location"),
-                                            "textRange": {
-                                                "type": "FIXED_RANGE",
-                                                "startIndex": api_start + offset,
-                                                "endIndex": api_start + offset + len(title),
-                                            },
-                                            "style": {"link": {"url": url}},
-                                            "fields": "link",
-                                        }
-                                    })
-                                    break
+                table_link_requests.append({
+                    "updateTextStyle": {
+                        "objectId": cell_info["table_obj_id"],
+                        "cellLocation": {"rowIndex": ri, "columnIndex": ci},
+                        "textRange": {
+                            "type": "FIXED_RANGE",
+                            "startIndex": start,
+                            "endIndex": end,
+                        },
+                        "style": {"link": {"url": url}},
+                        "fields": "link",
+                    }
+                })
 
         if table_link_requests:
             slides_svc.presentations().batchUpdate(
-                presentationId=TEMPLATE_ID, body={"requests": table_link_requests}
+                presentationId=pres_id, body={"requests": table_link_requests}
             ).execute()
+
+    # --- pass 4: bullet cleanup ---
+    # Remove bullets from table cells that are not resource-content cells (e.g.
+    # step-label column, header row) and from top-resource-link shapes. This
+    # ensures the output matches the template formatting regardless of whether
+    # the template copy inherited any accidental bullet styling.
+    cleanup_requests = []
+
+    for slide in pres.get("slides", []):
+        for el in slide.get("pageElements", []):
+            if "table" not in el:
+                continue
+            table_obj_id = el["objectId"]
+            for ri, trow in enumerate(el["table"].get("tableRows", [])):
+                for ci in range(len(trow.get("tableCells", []))):
+                    if (table_obj_id, ri, ci) not in placeholder_table_cells:
+                        cleanup_requests.append({
+                            "deleteParagraphBullets": {
+                                "objectId": table_obj_id,
+                                "cellLocation": {"rowIndex": ri, "columnIndex": ci},
+                                "textRange": {"type": "ALL"},
+                            }
+                        })
+
+    for obj_id in top_link_shape_map:
+        cleanup_requests.append({
+            "deleteParagraphBullets": {
+                "objectId": obj_id,
+                "textRange": {"type": "ALL"},
+            }
+        })
+
+    if cleanup_requests:
+        slides_svc.presentations().batchUpdate(
+            presentationId=pres_id, body={"requests": cleanup_requests}
+        ).execute()
