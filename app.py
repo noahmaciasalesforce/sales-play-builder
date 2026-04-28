@@ -250,10 +250,6 @@ if submitted:
             new_id, new_url = create_play_slides(play_name)
             st.write("New presentation created.")
 
-            st.write("Setting sharing permissions...")
-            share_file_public(new_id)
-            st.write("Deck shared (anyone with link can view).")
-
             st.write("Replacing placeholders and applying links...")
             replace_placeholders(new_id, replacements, link_map, bullet_placeholders, step_links)
             st.write("Content filled in.")
