@@ -94,7 +94,7 @@ def create_play_slides(play_name: str):
 
     copy = drive.files().copy(
         fileId=TEMPLATE_ID,
-        body={"name": f"{play_name} - Sales Play"},
+        body={"name": f"{play_name} - Sales Play", "parents": [DESTINATION_FOLDER_ID]},
         supportsAllDrives=True,
     ).execute()
     new_id = copy["id"]

@@ -254,10 +254,6 @@ if submitted:
             share_file_public(new_id)
             st.write("Deck shared (anyone with link can view).")
 
-            st.write("Moving to Salesforce Drive...")
-            move_to_salesforce_drive(new_id)
-            st.write("Deck moved to Salesforce Drive.")
-
             st.write("Replacing placeholders and applying links...")
             replace_placeholders(new_id, replacements, link_map, bullet_placeholders, step_links)
             st.write("Content filled in.")
